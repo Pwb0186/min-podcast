@@ -60,6 +60,10 @@ Som standard hentes playlisten til de nyeste 5 afsnit. Du kan aendre antallet:
 
 Hold gerne tallet moderat, fordi hver playliste kraever et ekstra opslag, hver gang feeds opdateres.
 
+Hentede playlister gemmes i `playlists.json` paa den udgivne side. Naeste gang genbruges de, saa aeldre afsnit beholder deres spilleliste, ogsaa efter de er faldet ud af de nyeste.
+
+Spillelisten skrives baade som tekst i beskrivelsen og som HTML-liste (`content:encoded`), saa podcast-apps der viser HTML faar et linjeskift pr. nummer.
+
 ## Find Korrekt Slug
 
 Hvis du har Node.js installeret lokalt, kan du soege saadan:
@@ -115,16 +119,15 @@ Workflowet ligger her:
 .github/workflows/update-feeds.yml
 ```
 
-Det kan koeres manuelt under fanen `Actions`, og det koerer ogsaa automatisk efter den tidsplan, der staar i workflow-filen.
-
-Den aktuelle tidsplan er dansk sommertid:
+GitHubs egen tidsplan var ustabil og sprang koersler over. Koerslerne startes derfor udefra via cron-job.org:
 
 ```text
-05:00, 07:00, 09:00, 11:00, 15:00, 18:00, 20:00
+https://cron-job.org/
 ```
 
-Bemaerk: GitHub bruger UTC, saa tiderne flytter sig en time ved vintertid.
-https://cron-job.org/en/
+cron-job.org kalder GitHub API'et med `workflow_dispatch`. Tidspunkterne styres derinde.
+
+GitHubs egen schedule i workflow-filen (en gang i doegnet kl. 03:23 UTC) ligger kun som backup. Workflowet kan ogsaa koeres manuelt under fanen `Actions`.
 
 ## Brug I Podcast-App
 
@@ -153,3 +156,7 @@ npm run search -- soegeord
 og kopier JSON-blokken med `slug`, `urn` og `title`.
 
 Hvis buildet fejler med `SyntaxError` i `podcasts.json`, mangler der typisk et komma mellem to podcasts, eller der er et ekstra komma efter den sidste.
+
+Hvis en enkelt podcast fejler, fortsaetter buildet. Det sidst udgivne feed for den podcast genbruges, saa den ikke forsvinder fra siden. Oversigten nederst i build-loggen (og i `Summary` paa GitHub Actions-koerslen) viser hvilke podcasts der blev bygget, genbrugt eller fejlede. Kun hvis ingen podcasts kan bygges, stopper workflowet uden at udgive.
+
+Hvis loggen siger `adgang naegtet (401/403)`, er API-noeglen sandsynligvis udskiftet. Opret eller ret variablen `DR_API_KEY` under `Settings` -> `Secrets and variables` -> `Actions` -> `Variables`. Den bruges i stedet for den indbyggede noegle.
