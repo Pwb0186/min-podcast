@@ -91,9 +91,9 @@ async function buildPodcast(podcast, slug) {
   }
 
   const resolved = resolvePodcast(seriesIndex, podcast, slug);
-  if (!podcast.urn && !podcast.urns?.length) {
-    const hint = resolved.urns.length > 1 ? `"urns": ${JSON.stringify(resolved.urns)}` : `"urn": "${resolved.urns[0]}"`;
-    console.log(`  Tip: tilføj ${hint} til ${slug} i podcasts.json`);
+  // Samleserier (flere urns) skal blive på slug, så nye sæsoner kommer med automatisk.
+  if (!podcast.urn && !podcast.urns?.length && resolved.urns.length === 1) {
+    console.log(`  Tip: tilføj "urn": "${resolved.urns[0]}" til ${slug} i podcasts.json`);
   }
 
   console.log(`Bygger ${podcast.title || resolved.primary.title} (${slug})`);

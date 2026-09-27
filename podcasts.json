@@ -4,6 +4,7 @@
   "podcasts": [
     {
       "slug": "genstart",
+      "urn": "urn:dr:radio:series:5fa25ef8330eac2f135b62d6",
       "title": "Genstart"
     },
     {
@@ -12,6 +13,7 @@
     },
     {
       "slug": "tiden",
+      "urn": "urn:dr:radio:series:6303281409585a83f19bfae0",
       "title": "Tiden"
     },
     {
@@ -20,33 +22,40 @@
     },
     {
       "slug": "bangers-med-ena",
+      "urn": "urn:dr:radio:series:658a0b71163dfa22d5605d6c",
       "title": "Bangers",
       "includePlaylist": true
     },
     {
       "slug": "flex",
+      "urn": "urn:dr:radio:series:65ddae6b71084fe132f41c50",
       "title": "Flex",
       "includePlaylist": true
     },
     {
       "slug": "p3-pulten",
+      "urn": "urn:dr:radio:series:658a0b67de044e79bdacf52e",
       "title": "Pulten",
       "includePlaylist": true
     },
     {
       "slug": "prompt",
+      "urn": "urn:dr:radio:series:64a66bcdc7644ff3cc5147a0",
       "title": "Prompt"
     },
     {
       "slug": "ubegribeligt",
+      "urn": "urn:dr:radio:series:626931758679fdf8af8a0e26",
       "title": "Ubegribeligt"
     },
     {
       "slug": "brinkmanns-briks",
+      "urn": "urn:dr:radio:series:5fa25a95330eac2f135b4a6c",
       "title": "Brinkmanns briks"
     },
     {
       "slug": "jagten-paa-det-evige-liv",
+      "urn": "urn:dr:radio:series:6621195eb5689c0891bc4b1c",
       "title": "Jagten paa det evige liv"
     },
     {
@@ -55,19 +64,23 @@
     },
     {
       "slug": "bakspejl",
+      "urn": "urn:dr:radio:series:5fa2623a330eac2f135b751f",
       "title": "Bakspejl"
     },
     {
       "slug": "stjerner-og-striber",
+      "urn": "urn:dr:radio:series:5fa25fb7330eac2f135b6691",
       "title": "Stjerner og striber"
     },
     {
       "slug": "p6-elsker",
+      "urn": "urn:dr:radio:series:5fa15703da351264f87b46c6",
       "title": "P6 elsker",
       "includePlaylist": true
     },
     {
       "slug": "troldspejlet-podcast",
+      "urn": "urn:dr:radio:series:5fa15fe5da351264f87b793d",
       "title": "Troldspejlet"
     },
     {
@@ -76,6 +89,7 @@
     },
     {
       "slug": "fonk-det-er-podcast",
+      "urn": "urn:dr:radio:series:5fa15b12da351264f87b5ca2",
       "title": "Fonk det er podcast",
       "includePlaylist": true
     }

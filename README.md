@@ -35,6 +35,8 @@ Naar du vil tilfoeje en podcast, tilfoejer du et nyt punkt i listen:
 
 `slug` bestemmer feed-adressen. `urn` er et internt serie-id, som goer opslaget mere stabilt, hvis et navn aendrer sig.
 
+Undtagelse: podcasts der er delt op i flere saesoner eller under-serier (fx `tyran`, `hvem-er`, `kup`, `de-lovloese`) skal kun have `slug`. Saa samler generatoren selv alle under-serier, og nye saesoner kommer med automatisk. En fast `urn` ville laase feedet til de gamle saesoner.
+
 ## Playlister I Musikprogrammer
 
 For et musikprogram kan playlisten tilfoejes til beskrivelsen af de nyeste afsnit:
