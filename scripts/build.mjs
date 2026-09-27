@@ -7,6 +7,8 @@ const DR_API_URL = process.env.DR_API_URL || "https://api.dr.dk/radio/v2";
 const DEFAULT_PLAYLIST_LIMIT = 5;
 const REQUEST_TIMEOUT_MS = 20000;
 const RETRY_ATTEMPTS = 3;
+// Alarm (fejlet workflow = mail fra GitHub), når en podcast har stået stille så længe.
+const STALE_ALERT_HOURS = Number(process.env.STALE_ALERT_HOURS || 24);
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const publicDir = join(root, "public");
@@ -75,6 +77,7 @@ await writeFile(
 await writeFile(join(publicDir, "playlists.json"), JSON.stringify(nextPlaylists), "utf8");
 
 await printReport(report);
+await writeAlert(report, rendered);
 
 if (!report.built.length) {
   // Intet er bygget friskt: lad være med at udgive, så den nuværende side bliver stående.
@@ -88,6 +91,10 @@ async function buildPodcast(podcast, slug) {
   }
 
   const resolved = resolvePodcast(seriesIndex, podcast, slug);
+  if (!podcast.urn && !podcast.urns?.length) {
+    const hint = resolved.urns.length > 1 ? `"urns": ${JSON.stringify(resolved.urns)}` : `"urn": "${resolved.urns[0]}"`;
+    console.log(`  Tip: tilføj ${hint} til ${slug} i podcasts.json`);
+  }
 
   console.log(`Bygger ${podcast.title || resolved.primary.title} (${slug})`);
   const showInfos = await Promise.all(resolved.urns.map((urn) => fetchJson(`${DR_API_URL}/series/${encodeURIComponent(urn)}`)));
@@ -132,7 +139,8 @@ async function buildPodcast(podcast, slug) {
     slug,
     title,
     imageUrl,
-    feedPath: `${slug}/feed.xml`
+    feedPath: `${slug}/feed.xml`,
+    urns: resolved.urns
   };
 }
 
@@ -154,11 +162,15 @@ async function reusePreviousFeed(podcast, slug) {
 
     const previous = previousManifest.podcasts?.find((item) => item.slug === slug);
     console.warn(`Genbruger sidst udgivne feed for ${slug}.`);
-    return previous || {
+    const imageMatch = /<itunes:image href="([^"]+)"/.exec(feed);
+    return {
       slug,
-      title: podcast.title || slug,
-      imageUrl: /<itunes:image href="([^"]+)"/.exec(feed)?.[1] ? unxml(/<itunes:image href="([^"]+)"/.exec(feed)[1]) : "",
-      feedPath: `${slug}/feed.xml`
+      title: previous?.title || podcast.title || slug,
+      imageUrl: previous?.imageUrl ?? (imageMatch ? unxml(imageMatch[1]) : ""),
+      feedPath: `${slug}/feed.xml`,
+      urns: previous?.urns || [],
+      // Tidspunktet hvor podcasten første gang ikke kunne bygges.
+      staleSince: previous?.staleSince || new Date().toISOString()
     };
   } catch (error) {
     console.warn(`Kunne heller ikke hente tidligere feed for ${slug}: ${error.message}`);
@@ -174,6 +186,31 @@ async function fetchPublishedJson(path, fallback) {
   } catch {
     console.log(`Ingen tidligere ${path} fundet (det er normalt første gang).`);
     return fallback;
+  }
+}
+
+async function writeAlert(report, rendered) {
+  const now = Date.now();
+  const problems = [];
+
+  for (const item of report.reused) {
+    const entry = rendered.find((podcast) => podcast.slug === item.slug);
+    const hours = entry?.staleSince ? (now - new Date(entry.staleSince)) / 36e5 : 0;
+    if (hours >= STALE_ALERT_HOURS) {
+      problems.push(`${item.slug} er ikke opdateret i ${Math.floor(hours)} timer: ${item.reason}`);
+    }
+  }
+  for (const item of report.failed) {
+    problems.push(`${item.slug} mangler helt på siden: ${item.reason}`);
+  }
+
+  for (const problem of problems) {
+    console.log(`::warning::${problem}`);
+  }
+
+  if (process.env.GITHUB_OUTPUT) {
+    const message = problems.join(" | ").replace(/[\r\n]+/g, " ");
+    await appendFile(process.env.GITHUB_OUTPUT, `alert=${problems.length ? "true" : "false"}\nalert_message=${message}\n`);
   }
 }
 

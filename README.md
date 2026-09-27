@@ -160,3 +160,5 @@ Hvis buildet fejler med `SyntaxError` i `podcasts.json`, mangler der typisk et k
 Hvis en enkelt podcast fejler, fortsaetter buildet. Det sidst udgivne feed for den podcast genbruges, saa den ikke forsvinder fra siden. Oversigten nederst i build-loggen (og i `Summary` paa GitHub Actions-koerslen) viser hvilke podcasts der blev bygget, genbrugt eller fejlede. Kun hvis ingen podcasts kan bygges, stopper workflowet uden at udgive.
 
 Hvis loggen siger `adgang naegtet (401/403)`, er API-noeglen sandsynligvis udskiftet. Opret eller ret variablen `DR_API_KEY` under `Settings` -> `Secrets and variables` -> `Actions` -> `Variables`. Den bruges i stedet for den indbyggede noegle.
+
+Hvis en podcast har staaet stille i mere end 24 timer (eller mangler helt), fejler jobbet `alarm` efter siden er udgivet. Saa sender GitHub en mail, og du behoever ikke selv holde oeje med `Actions`. Siden er stadig opdateret med de podcasts, der virker.

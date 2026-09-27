@@ -24,6 +24,9 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      alert: ${{ steps.build.outputs.alert }}
+      alert_message: ${{ steps.build.outputs.alert_message }}
     steps:
       - name: Hent repository
         uses: actions/checkout@v7
@@ -34,6 +37,7 @@ jobs:
           node-version: 24
 
       - name: Byg private feeds
+        id: build
         env:
           SITE_BASE_URL: ${{ vars.SITE_BASE_URL }}
           DR_API_KEY: ${{ vars.DR_API_KEY }}
@@ -57,3 +61,17 @@ jobs:
       - name: Udgiv til GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v5
+
+  # Siden er udgivet, men mindst én podcast har stået stille for længe.
+  # Et fejlet job får GitHub til at sende en mail.
+  alarm:
+    runs-on: ubuntu-latest
+    needs: [build, deploy]
+    if: needs.build.outputs.alert == 'true'
+    steps:
+      - name: Podcast står stille
+        env:
+          MESSAGE: ${{ needs.build.outputs.alert_message }}
+        run: |
+          echo "::error::$MESSAGE"
+          exit 1
