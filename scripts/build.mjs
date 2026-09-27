@@ -1,16 +1,19 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const DR_API_KEY = process.env.DR_API_KEY || "6Wkh8s98Afx1ZAaTT4FuWODTmvWGDPpR";
 const DR_API_URL = process.env.DR_API_URL || "https://api.dr.dk/radio/v2";
+const DEFAULT_PLAYLIST_LIMIT = 5;
+const REQUEST_TIMEOUT_MS = 20000;
+const RETRY_ATTEMPTS = 3;
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const publicDir = join(root, "public");
 const configPath = join(root, "podcasts.json");
 
 const config = JSON.parse(await readFile(configPath, "utf8"));
-const siteTitle = config.siteTitle || "Mine DR Podcasts";
+const siteTitle = config.siteTitle || "Mine Podcasts";
 const baseUrl = (process.env.SITE_BASE_URL || config.baseUrl || "").replace(/\/$/, "");
 const podcasts = Array.isArray(config.podcasts) ? config.podcasts : [];
 
@@ -22,12 +25,68 @@ await mkdir(publicDir, { recursive: true });
 await mkdir(join(publicDir, "assets"), { recursive: true });
 await writeFile(join(publicDir, "assets", "style.css"), css(), "utf8");
 
-console.log("Henter DR's serieliste");
-const seriesIndex = await loadSeriesIndex();
+// Tidligere udgivet tilstand: bruges som reserve, hvis en podcast fejler,
+// og som cache for playlister, så ældre afsnit beholder deres spilleliste.
+const previousManifest = await fetchPublishedJson("manifest.json", { podcasts: [] });
+const previousPlaylists = await fetchPublishedJson("playlists.json", {});
+const nextPlaylists = {};
+
+let seriesIndex = null;
+let seriesIndexError = null;
+console.log("Henter serieliste");
+try {
+  seriesIndex = await loadSeriesIndex();
+} catch (error) {
+  seriesIndexError = error;
+  console.warn(`Kunne ikke hente serielisten: ${error.message}`);
+}
+
 const rendered = [];
+const report = { built: [], reused: [], failed: [] };
 
 for (const podcast of podcasts) {
   const slug = podcast.slug || slugFromFeedUrl(podcast.feedUrl);
+  try {
+    const result = await buildPodcast(podcast, slug);
+    if (result) {
+      rendered.push(result);
+      report.built.push(slug);
+    } else {
+      report.failed.push({ slug, reason: "ingen episoder fundet" });
+    }
+  } catch (error) {
+    console.warn(`Fejl i ${slug}: ${error.message}`);
+    const reused = await reusePreviousFeed(podcast, slug);
+    if (reused) {
+      rendered.push(reused);
+      report.reused.push({ slug, reason: error.message });
+    } else {
+      report.failed.push({ slug, reason: error.message });
+    }
+  }
+}
+
+await writeFile(join(publicDir, "index.html"), renderIndex(rendered), "utf8");
+await writeFile(
+  join(publicDir, "manifest.json"),
+  JSON.stringify({ builtAt: new Date().toISOString(), podcasts: rendered }, null, 2),
+  "utf8"
+);
+await writeFile(join(publicDir, "playlists.json"), JSON.stringify(nextPlaylists), "utf8");
+
+await printReport(report);
+
+if (!report.built.length) {
+  // Intet er bygget friskt: lad være med at udgive, så den nuværende side bliver stående.
+  console.error("Ingen podcasts blev bygget. Udgiver ikke.");
+  process.exit(1);
+}
+
+async function buildPodcast(podcast, slug) {
+  if (!seriesIndex && !podcast.urn && !podcast.urns?.length) {
+    throw new Error(`serielisten mangler (${seriesIndexError?.message || "ukendt fejl"}), og der er ingen urn`);
+  }
+
   const resolved = resolvePodcast(seriesIndex, podcast, slug);
 
   console.log(`Bygger ${podcast.title || resolved.primary.title} (${slug})`);
@@ -39,7 +98,7 @@ for (const podcast of podcasts) {
 
   if (!episodes.length) {
     console.warn(`Springer ${slug} over, fordi der ikke blev fundet episoder.`);
-    continue;
+    return null;
   }
 
   const title = podcast.title || primaryShow.title || slug;
@@ -49,7 +108,7 @@ for (const podcast of podcasts) {
   const feedUrl = `${baseUrl}/${slug}/feed.xml`;
   const targetDir = join(publicDir, slug);
   const playlists = podcast.includePlaylist
-    ? await loadPlaylists(episodes, podcast.playlistEpisodeLimit || 4, title)
+    ? await loadPlaylists(episodes, podcast.playlistEpisodeLimit ?? DEFAULT_PLAYLIST_LIMIT, title)
     : new Map();
 
   await mkdir(targetDir, { recursive: true });
@@ -64,21 +123,73 @@ for (const podcast of podcasts) {
       imageLink: primaryShow.presentationUrl,
       category: primaryShow.categories?.[0] || "News",
       lastBuildDate: formatRssDate(new Date(episodes[0].publishTime)),
-      items: episodes.map((episode) => toFeedItem(episode, primaryShow.presentationUrl, playlists.get(episodeKey(episode))))
+      items: episodes.map((episode) => toFeedItem(episode, primaryShow.presentationUrl, playlists.get(String(episodeKey(episode)))))
     }),
     "utf8"
   );
 
-  rendered.push({
+  return {
     slug,
     title,
     imageUrl,
     feedPath: `${slug}/feed.xml`
-  });
+  };
 }
 
-await writeFile(join(publicDir, "index.html"), renderIndex(rendered), "utf8");
-console.log(`Byggede ${rendered.length} podcasts i public/.`);
+async function reusePreviousFeed(podcast, slug) {
+  if (!baseUrl) return null;
+  try {
+    const response = await fetchWithRetry(`${baseUrl}/${slug}/feed.xml?t=${Date.now()}`, {}, { attempts: 2 });
+    const feed = await response.text();
+    if (!feed.includes("<rss")) return null;
+
+    await mkdir(join(publicDir, slug), { recursive: true });
+    await writeFile(join(publicDir, slug, "feed.xml"), feed, "utf8");
+
+    // Behold tidligere hentede playlister for denne podcast.
+    for (const guid of feed.matchAll(/<guid[^>]*>([^<]+)<\/guid>/g)) {
+      const key = unxml(guid[1]);
+      if (previousPlaylists[key]) nextPlaylists[key] = previousPlaylists[key];
+    }
+
+    const previous = previousManifest.podcasts?.find((item) => item.slug === slug);
+    console.warn(`Genbruger sidst udgivne feed for ${slug}.`);
+    return previous || {
+      slug,
+      title: podcast.title || slug,
+      imageUrl: /<itunes:image href="([^"]+)"/.exec(feed)?.[1] ? unxml(/<itunes:image href="([^"]+)"/.exec(feed)[1]) : "",
+      feedPath: `${slug}/feed.xml`
+    };
+  } catch (error) {
+    console.warn(`Kunne heller ikke hente tidligere feed for ${slug}: ${error.message}`);
+    return null;
+  }
+}
+
+async function fetchPublishedJson(path, fallback) {
+  if (!baseUrl) return fallback;
+  try {
+    const response = await fetchWithRetry(`${baseUrl}/${path}?t=${Date.now()}`, {}, { attempts: 2 });
+    return await response.json();
+  } catch {
+    console.log(`Ingen tidligere ${path} fundet (det er normalt første gang).`);
+    return fallback;
+  }
+}
+
+function printReport({ built, reused, failed }) {
+  console.log("");
+  console.log(`Bygget: ${built.length}  Genbrugt: ${reused.length}  Fejlet: ${failed.length}`);
+  for (const item of reused) console.log(`  genbrugt  ${item.slug}: ${item.reason}`);
+  for (const item of failed) console.log(`  fejlet    ${item.slug}: ${item.reason}`);
+
+  if (process.env.GITHUB_STEP_SUMMARY && (reused.length || failed.length)) {
+    const lines = ["### Podcast-build", "", `Bygget: ${built.length} · Genbrugt: ${reused.length} · Fejlet: ${failed.length}`, ""];
+    for (const item of reused) lines.push(`- ⚠️ genbrugt \`${item.slug}\`: ${item.reason}`);
+    for (const item of failed) lines.push(`- ❌ fejlet \`${item.slug}\`: ${item.reason}`);
+    return appendFile(process.env.GITHUB_STEP_SUMMARY, `${lines.join("\n")}\n`).catch(() => {});
+  }
+}
 
 async function loadSeriesIndex() {
   const data = await fetchJson(`${DR_API_URL}/series?limit=10000`);
@@ -107,6 +218,7 @@ async function loadSeriesIndex() {
 }
 
 function resolvePodcast(index, podcast, slug) {
+  index ||= { bySlug: new Map(), umbrellaGroups: new Map() };
   if (podcast.urns?.length) {
     return {
       urns: podcast.urns,
@@ -134,7 +246,7 @@ function resolvePodcast(index, podcast, slug) {
 
   const show = index.bySlug.get(slug);
   if (!show) {
-    throw new Error(`Kunne ikke finde DR-serien "${slug}". Tjek slug i podcasts.json.`);
+    throw new Error(`Kunne ikke finde serien "${slug}". Tjek slug i podcasts.json, eller tilføj urn.`);
   }
 
   return {
@@ -158,27 +270,60 @@ async function fetchEpisodes(urn) {
 }
 
 async function fetchJson(url) {
-  const response = await fetch(url, {
+  const response = await fetchWithRetry(url, {
     headers: {
       "accept": "application/json",
       "referer": "https://www.dr.dk/",
-      "user-agent": "privat-dr-podcast-manager/2.0",
+      "user-agent": "privat-podcast-manager/2.0",
       "x-apikey": DR_API_KEY
     }
   });
-
-  if (!response.ok) {
-    throw new Error(`DR API svarede ${response.status} for ${url}`);
-  }
-
   return response.json();
 }
 
+async function fetchWithRetry(url, options = {}, { attempts = RETRY_ATTEMPTS } = {}) {
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      const response = await fetch(url, { ...options, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+      if (response.ok) return response;
+
+      if (response.status === 401 || response.status === 403) {
+        // Giver ikke mening at prøve igen – typisk er nøglen udskiftet.
+        throw Object.assign(
+          new Error(`adgang nægtet (${response.status}) for ${shortUrl(url)}. API-nøglen er muligvis udskiftet – opdater variablen DR_API_KEY.`),
+          { fatal: true }
+        );
+      }
+      if (response.status === 404) {
+        throw Object.assign(new Error(`ikke fundet (404): ${shortUrl(url)}`), { fatal: true });
+      }
+      lastError = new Error(`svarede ${response.status} for ${shortUrl(url)}`);
+    } catch (error) {
+      if (error.fatal) throw error;
+      lastError = error.name === "TimeoutError"
+        ? new Error(`timeout efter ${REQUEST_TIMEOUT_MS / 1000}s for ${shortUrl(url)}`)
+        : error;
+    }
+    if (attempt < attempts) {
+      await sleep(1000 * 2 ** (attempt - 1));
+    }
+  }
+  throw lastError;
+}
+
+function shortUrl(url) {
+  return String(url).replace(/\?.*$/, "");
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function findPodcastImageUrl(slug) {
-  const response = await fetch(`https://api.dr.dk/podcasts/v1/feeds/${slug}.xml?format=podcast`, {
-    headers: { "user-agent": "privat-dr-podcast-manager/2.0" }
-  });
-  if (!response.ok) return "";
+  const response = await fetchWithRetry(`https://api.dr.dk/podcasts/v1/feeds/${slug}.xml?format=podcast`, {
+    headers: { "user-agent": "privat-podcast-manager/2.0" }
+  }, { attempts: 2 });
   const xml = await response.text();
   return (
     /<itunes:image[^>]+href="([^"]+)"/i.exec(xml)?.[1] ||
@@ -198,20 +343,41 @@ function findRadioImageUrl(show) {
 }
 
 async function loadPlaylists(episodes, limit, title) {
-  const selectedEpisodes = episodes.slice(0, Math.max(0, Number(limit) || 5));
+  const fetchCount = Math.max(0, Number(limit) || 0);
   const playlists = new Map();
+  let fetched = 0;
+  let empty = 0;
 
-  console.log(`Henter playlister for de nyeste ${selectedEpisodes.length} afsnit af ${title}`);
+  console.log(`Henter playlister for de nyeste ${Math.min(fetchCount, episodes.length)} afsnit af ${title}`);
 
-  for (const episode of selectedEpisodes) {
-    try {
-      const tracks = await fetchPlaylist(episode.presentationUrl);
-      if (tracks.length) {
-        playlists.set(episodeKey(episode), tracks);
+  for (const [index, episode] of episodes.entries()) {
+    const key = String(episodeKey(episode));
+    let tracks = null;
+
+    // De nyeste afsnit hentes altid på ny (spillelisten kan blive udfyldt senere);
+    // ældre afsnit bruger den gemte spilleliste fra sidste udgivelse.
+    if (index < fetchCount) {
+      try {
+        tracks = await fetchPlaylist(episode.presentationUrl);
+        fetched++;
+        if (!tracks.length) empty++;
+      } catch (error) {
+        console.warn(`Kunne ikke hente playliste for ${episode.title}: ${error.message}`);
       }
-    } catch (error) {
-      console.warn(`Kunne ikke hente playliste for ${episode.title}: ${error.message}`);
     }
+
+    if (!tracks?.length && previousPlaylists[key]?.length) {
+      tracks = previousPlaylists[key];
+    }
+
+    if (tracks?.length) {
+      playlists.set(key, tracks);
+      nextPlaylists[key] = tracks;
+    }
+  }
+
+  if (fetched > 0 && fetched === empty) {
+    console.warn(`Advarsel: ingen af de ${fetched} hentede afsnit af ${title} havde en spilleliste. Sidens opbygning kan være ændret.`);
   }
 
   return playlists;
@@ -220,13 +386,9 @@ async function loadPlaylists(episodes, limit, title) {
 async function fetchPlaylist(pageUrl) {
   if (!pageUrl) return [];
 
-  const response = await fetch(pageUrl, {
+  const response = await fetchWithRetry(pageUrl, {
     headers: { "user-agent": "privat-podcast-manager/2.0" }
-  });
-
-  if (!response.ok) {
-    throw new Error(`siden svarede ${response.status}`);
-  }
+  }, { attempts: 2 });
 
   const page = await response.text();
   const nextData = /<script[^>]*id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/i.exec(page)?.[1];
@@ -254,6 +416,7 @@ function toFeedItem(episode, fallbackLink, playlist = []) {
     link: episode.presentationUrl || fallbackLink,
     title: episode.title || "Uden titel",
     description: appendPlaylist(episode.description || "", playlist),
+    contentHtml: renderDescriptionHtml(episode.description || "", playlist),
     pubDate: formatRssDate(new Date(episode.publishTime)),
     duration: formatDuration(episode.durationMilliseconds || 0),
     enclosureUrl: audioAsset.url,
@@ -271,15 +434,28 @@ function appendPlaylist(description, playlist) {
   return `${description}\n\nSpilleliste:\n${tracks}`;
 }
 
+function renderDescriptionHtml(description, playlist) {
+  const body = html(description).replace(/\n/g, "<br>");
+  if (!playlist.length) return `<p>${body}</p>`;
+
+  const tracks = playlist
+    .map((track) => `<li>${formatTrackTime(track.offsetMilliseconds)} ${track.artist ? `${html(track.artist)} - ` : ""}${html(track.title)}</li>`)
+    .join("");
+
+  return `<p>${body}</p><p><strong>Spilleliste:</strong></p><ul>${tracks}</ul>`;
+}
+
 function episodeKey(episode) {
   return episode.productionNumber || episode.id;
 }
 
 function formatTrackTime(milliseconds) {
   const totalSeconds = Math.floor(milliseconds / 1000);
-  const minutes = Math.floor(totalSeconds / 60);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
   const seconds = totalSeconds % 60;
-  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+  const mmss = `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+  return hours ? `${hours}:${mmss}` : mmss;
 }
 
 function renderFeed(feed) {
@@ -289,6 +465,7 @@ function renderFeed(feed) {
             <link>${xml(item.link)}</link>
             <title>${xml(item.title)}</title>
             <description>${xml(item.description)}</description>
+            <content:encoded><![CDATA[${cdata(item.contentHtml)}]]></content:encoded>
             <pubDate>${xml(item.pubDate)}</pubDate>
             <explicit>no</explicit>
             <itunes:author>DR</itunes:author>
@@ -306,7 +483,7 @@ function renderFeed(feed) {
         <itunes:image href="${xml(feed.imageUrl)}"/>` : "";
 
   return `<?xml version="1.0" encoding="UTF-8"?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd" xmlns:media="http://search.yahoo.com/mrss/" version="2.0">
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd" xmlns:media="http://search.yahoo.com/mrss/" version="2.0">
     <channel>
         <atom:link href="${xml(feed.feedUrl)}" rel="self" type="application/rss+xml"/>
         <title>${xml(feed.title)}</title>
@@ -445,6 +622,19 @@ function xml(value = "") {
 
 function html(value = "") {
   return xml(value);
+}
+
+function cdata(value = "") {
+  return String(value).replaceAll("]]>", "]]]]><![CDATA[>");
+}
+
+function unxml(value = "") {
+  return String(value)
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&quot;", '"')
+    .replaceAll("&apos;", "'")
+    .replaceAll("&amp;", "&");
 }
 
 function css() {
