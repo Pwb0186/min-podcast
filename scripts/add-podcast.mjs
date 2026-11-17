@@ -1,12 +1,12 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { loadSeriesIndex } from "./lib/dr.mjs";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const configPath = join(root, "podcasts.json");
 const input = process.argv[2];
 const titleArg = process.argv.slice(3).join(" ").trim();
-const DR_API_KEY = process.env.DR_API_KEY || "6Wkh8s98Afx1ZAaTT4FuWODTmvWGDPpR";
 
 if (!input) {
   console.error("Brug: npm run add -- genstart");
@@ -23,16 +23,34 @@ if (config.podcasts.some((podcast) => podcast.slug === slug)) {
   process.exit(0);
 }
 
-let title = titleArg;
-if (!title) {
-  title = await fetchTitle(slug).catch(() => slug);
+const entry = { slug };
+try {
+  const index = await loadSeriesIndex();
+  const collection = index.umbrellaGroups.get(slug);
+  const show = index.bySlug.get(slug);
+
+  if (collection?.length > 1) {
+    // Samleserie: kun slug, så nye sæsoner kommer med automatisk.
+    console.log(`${slug} er en samleserie med ${collection.length} under-serier. Tilføjer uden urn.`);
+    entry.title = titleArg || collection[0].umbrella?.title || show?.title || slug;
+  } else if (show) {
+    entry.urn = show.id;
+    entry.title = titleArg || show.title || slug;
+  } else {
+    console.warn(`Fandt ikke "${slug}" i serielisten. Tjek med: npm run search -- ${slug}`);
+    entry.title = titleArg || slug;
+  }
+} catch (error) {
+  console.warn(`Kunne ikke slå serien op (${error.message}). Tilføjer uden urn.`);
+  entry.title = titleArg || slug;
 }
 
-config.podcasts.push({ slug, title });
-config.podcasts.sort((a, b) => (a.title || a.slug).localeCompare(b.title || b.slug, "da"));
+// Tilføjes nederst, så den eksisterende rækkefølge bevares.
+config.podcasts.push(entry);
 
 await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
-console.log(`Tilføjede ${title} (${slug}) til podcasts.json.`);
+console.log(`Tilføjede ${entry.title} (${slug}) til podcasts.json:`);
+console.log(JSON.stringify(entry, null, 2));
 
 function extractSlug(value) {
   const trimmed = value.trim();
@@ -47,43 +65,4 @@ function extractSlug(value) {
   if (pageMatch) return pageMatch[1];
 
   return lastPart;
-}
-
-async function fetchTitle(slug) {
-  const response = await fetch("https://api.dr.dk/radio/v2/series?limit=10000", {
-    headers: {
-      "accept": "application/json",
-      "referer": "https://www.dr.dk/",
-      "user-agent": "privat-dr-podcast-manager/2.0",
-      "x-apikey": DR_API_KEY
-    }
-  });
-  if (!response.ok) throw new Error(`Kunne ikke hente titel for ${slug}`);
-  const data = await response.json();
-  const show = (data.items || []).find((item) => deriveSlug(item) === slug || derivePresentationSlug(item) === slug);
-  return show?.title || slug;
-}
-
-function deriveSlug(item) {
-  const fromPodcastUrl = item.podcastUrl ? String(item.podcastUrl).split("/").filter(Boolean).at(-1) : "";
-  return String(fromPodcastUrl || item.psdbSlug || item.slug || "")
-    .replace(/\.xml.*$/, "")
-    .replace(/-\d+$/, "")
-    .replace(/^sara-og-monopolet-podcast$/, "sara-og-monopolet")
-    .replace(/^mads-monopolet-podcast$/, "sara-og-monopolet")
-    .replace(/^hjernekassen-paa-p1$/, "hjernekassen")
-    .replace(/^hjernekassen-pa-p1$/, "hjernekassen")
-    .replace(/^moerklagt-agent-samsam$/, "moerklagt");
-}
-
-function derivePresentationSlug(item) {
-  const fromPresentationUrl = item.presentationUrl ? String(item.presentationUrl).split("/").filter(Boolean).at(-1) : "";
-  return String(fromPresentationUrl || item.slug || "")
-    .replace(/\.xml.*$/, "")
-    .replace(/-\d+$/, "")
-    .replace(/^sara-og-monopolet-podcast$/, "sara-og-monopolet")
-    .replace(/^mads-monopolet-podcast$/, "sara-og-monopolet")
-    .replace(/^hjernekassen-paa-p1$/, "hjernekassen")
-    .replace(/^hjernekassen-pa-p1$/, "hjernekassen")
-    .replace(/^moerklagt-agent-samsam$/, "moerklagt");
 }
