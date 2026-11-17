@@ -80,7 +80,15 @@ eller:
 npm run search -- "p6 elsker"
 ```
 
-Soegningen viser en JSON-blok, som kan kopieres direkte ind i `podcasts.json`.
+Soegningen viser en JSON-blok, som kan kopieres direkte ind i `podcasts.json`. Er resultatet en del af en samleserie, viser blokken samleseriens slug uden `urn`.
+
+Du kan ogsaa tilfoeje en podcast direkte:
+
+```bash
+npm run add -- genstart
+```
+
+Den slaar serien op, tilfoejer `urn` (eller kun `slug` for samleserier) og laegger podcasten nederst i listen.
 
 Du kan ogsaa redigere listen manuelt uden at bruge `npm`.
 
@@ -163,4 +171,10 @@ Hvis en enkelt podcast fejler, fortsaetter buildet. Det sidst udgivne feed for d
 
 Hvis loggen siger `adgang naegtet (401/403)`, er API-noeglen sandsynligvis udskiftet. Opret eller ret variablen `DR_API_KEY` under `Settings` -> `Secrets and variables` -> `Actions` -> `Variables`. Den bruges i stedet for den indbyggede noegle.
 
-Hvis en podcast har staaet stille i mere end 24 timer (eller mangler helt), fejler jobbet `alarm` efter siden er udgivet. Saa sender GitHub en mail, og du behoever ikke selv holde oeje med `Actions`. Siden er stadig opdateret med de podcasts, der virker.
+Hvis en podcast har staaet stille i mere end 24 timer (eller mangler helt), eller hvis spillelisterne for et musikprogram har vaeret vaek i mere end 24 timer, fejler jobbet `alarm` efter siden er udgivet. Saa sender GitHub en mail, og du behoever ikke selv holde oeje med `Actions`. Siden er stadig opdateret med de podcasts, der virker.
+
+Samme problem giver hoejst en mail i doegnet, ogsaa selvom workflowet koerer flere gange om dagen. Hvornaar et problem startede, og hvornaar der sidst blev sendt mail, gemmes i `manifest.json` paa siden.
+
+Hvis en podcast pludselig ikke har nogen afsnit (fx fordi alle afsnit af et musikprogram er udloebet), beholdes det sidst udgivne feed, og den taeller som en podcast der staar stille.
+
+Hvis den udgivne side ikke kan svare, naar buildet henter `manifest.json` og `playlists.json`, stopper buildet uden at udgive. Ellers ville gemte spillelister gaa tabt. Det giver en fejlet koersel, som retter sig selv ved naeste koersel.

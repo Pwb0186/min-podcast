@@ -1,14 +1,13 @@
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { DR_API_URL, fetchJson, fetchWithRetry, loadSeriesIndex } from "./lib/dr.mjs";
 
-const DR_API_KEY = process.env.DR_API_KEY || "6Wkh8s98Afx1ZAaTT4FuWODTmvWGDPpR";
-const DR_API_URL = process.env.DR_API_URL || "https://api.dr.dk/radio/v2";
 const DEFAULT_PLAYLIST_LIMIT = 5;
-const REQUEST_TIMEOUT_MS = 20000;
-const RETRY_ATTEMPTS = 3;
-// Alarm (fejlet workflow = mail fra GitHub), når en podcast har stået stille så længe.
+// Alarm (fejlet workflow = mail fra GitHub), når et problem har varet så længe.
 const STALE_ALERT_HOURS = Number(process.env.STALE_ALERT_HOURS || 24);
+// Samme problem giver højst én mail pr. så mange timer.
+const ALERT_REPEAT_HOURS = Number(process.env.ALERT_REPEAT_HOURS || 24);
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const publicDir = join(root, "public");
@@ -29,8 +28,15 @@ await writeFile(join(publicDir, "assets", "style.css"), css(), "utf8");
 
 // Tidligere udgivet tilstand: bruges som reserve, hvis en podcast fejler,
 // og som cache for playlister, så ældre afsnit beholder deres spilleliste.
-const previousManifest = await fetchPublishedJson("manifest.json", { podcasts: [] });
-const previousPlaylists = await fetchPublishedJson("playlists.json", {});
+let previousManifest;
+let previousPlaylists;
+try {
+  previousManifest = await fetchPublishedJson("manifest.json", { podcasts: [] });
+  previousPlaylists = await fetchPublishedJson("playlists.json", {});
+} catch (error) {
+  console.error(error.message);
+  process.exit(1);
+}
 const nextPlaylists = {};
 
 let seriesIndex = null;
@@ -44,18 +50,13 @@ try {
 }
 
 const rendered = [];
-const report = { built: [], reused: [], failed: [] };
+const report = { built: [], reused: [], failed: [], playlistProblems: [] };
 
 for (const podcast of podcasts) {
   const slug = podcast.slug || slugFromFeedUrl(podcast.feedUrl);
   try {
-    const result = await buildPodcast(podcast, slug);
-    if (result) {
-      rendered.push(result);
-      report.built.push(slug);
-    } else {
-      report.failed.push({ slug, reason: "ingen episoder fundet" });
-    }
+    rendered.push(await buildPodcast(podcast, slug));
+    report.built.push(slug);
   } catch (error) {
     console.warn(`Fejl i ${slug}: ${error.message}`);
     const reused = await reusePreviousFeed(podcast, slug);
@@ -68,16 +69,18 @@ for (const podcast of podcasts) {
   }
 }
 
+const alertState = evaluateAlerts(report, rendered);
+
 await writeFile(join(publicDir, "index.html"), renderIndex(rendered), "utf8");
 await writeFile(
   join(publicDir, "manifest.json"),
-  JSON.stringify({ builtAt: new Date().toISOString(), podcasts: rendered }, null, 2),
+  JSON.stringify({ builtAt: new Date().toISOString(), podcasts: rendered, alerts: alertState.alerts }, null, 2),
   "utf8"
 );
 await writeFile(join(publicDir, "playlists.json"), JSON.stringify(nextPlaylists), "utf8");
 
 await printReport(report);
-await writeAlert(report, rendered);
+await writeAlertOutput(alertState);
 
 if (!report.built.length) {
   // Intet er bygget friskt: lad være med at udgive, så den nuværende side bliver stående.
@@ -104,8 +107,7 @@ async function buildPodcast(podcast, slug) {
     .sort((a, b) => new Date(b.publishTime) - new Date(a.publishTime));
 
   if (!episodes.length) {
-    console.warn(`Springer ${slug} over, fordi der ikke blev fundet episoder.`);
-    return null;
+    throw new Error("ingen episoder fundet");
   }
 
   const title = podcast.title || primaryShow.title || slug;
@@ -115,7 +117,7 @@ async function buildPodcast(podcast, slug) {
   const feedUrl = `${baseUrl}/${slug}/feed.xml`;
   const targetDir = join(publicDir, slug);
   const playlists = podcast.includePlaylist
-    ? await loadPlaylists(episodes, podcast.playlistEpisodeLimit ?? DEFAULT_PLAYLIST_LIMIT, title)
+    ? await loadPlaylists(episodes, podcast.playlistEpisodeLimit ?? DEFAULT_PLAYLIST_LIMIT, title, slug)
     : new Map();
 
   await mkdir(targetDir, { recursive: true });
@@ -147,8 +149,7 @@ async function buildPodcast(podcast, slug) {
 async function reusePreviousFeed(podcast, slug) {
   if (!baseUrl) return null;
   try {
-    const response = await fetchWithRetry(`${baseUrl}/${slug}/feed.xml?t=${Date.now()}`, {}, { attempts: 2 });
-    const feed = await response.text();
+    const feed = await fetchWithRetry(`${baseUrl}/${slug}/feed.xml?t=${Date.now()}`, {}, { attempts: 2, read: (response) => response.text() });
     if (!feed.includes("<rss")) return null;
 
     await mkdir(join(publicDir, slug), { recursive: true });
@@ -181,77 +182,92 @@ async function reusePreviousFeed(podcast, slug) {
 async function fetchPublishedJson(path, fallback) {
   if (!baseUrl) return fallback;
   try {
-    const response = await fetchWithRetry(`${baseUrl}/${path}?t=${Date.now()}`, {}, { attempts: 2 });
-    return await response.json();
-  } catch {
-    console.log(`Ingen tidligere ${path} fundet (det er normalt første gang).`);
-    return fallback;
+    return await fetchWithRetry(`${baseUrl}/${path}?t=${Date.now()}`, {}, { read: (response) => response.json() });
+  } catch (error) {
+    if (error.status === 404) {
+      console.log(`Ingen tidligere ${path} fundet (det er normalt første gang).`);
+      return fallback;
+    }
+    // Udgiver vi uden den gemte fil, mistes spillelister og alarm-tilstand.
+    throw new Error(`Kunne ikke hente ${path} fra den udgivne side (${error.message}). Stopper uden at udgive, så intet gemt går tabt.`);
   }
 }
 
-async function writeAlert(report, rendered) {
+// Samler problemer og afgør, hvilke der skal give mail nu.
+// Tilstanden gemmes i manifest.json: hvornår hvert problem startede, og hvornår der sidst blev sendt mail.
+function evaluateAlerts(report, rendered) {
   const now = Date.now();
+  const previousAlerts = previousManifest.alerts || {};
   const problems = [];
 
   for (const item of report.reused) {
     const entry = rendered.find((podcast) => podcast.slug === item.slug);
-    const hours = entry?.staleSince ? (now - new Date(entry.staleSince)) / 36e5 : 0;
-    if (hours >= STALE_ALERT_HOURS) {
-      problems.push(`${item.slug} er ikke opdateret i ${Math.floor(hours)} timer: ${item.reason}`);
-    }
+    problems.push({
+      key: item.slug,
+      since: entry?.staleSince,
+      minHours: STALE_ALERT_HOURS,
+      message: (hours) => `${item.slug} er ikke opdateret i ${hours} timer: ${item.reason}`
+    });
   }
   for (const item of report.failed) {
-    problems.push(`${item.slug} mangler helt på siden: ${item.reason}`);
+    problems.push({
+      key: item.slug,
+      minHours: 0,
+      message: () => `${item.slug} mangler helt på siden: ${item.reason}`
+    });
+  }
+  for (const item of report.playlistProblems) {
+    problems.push({
+      key: `${item.slug}:spilleliste`,
+      minHours: STALE_ALERT_HOURS,
+      message: (hours) => `${item.slug} har ikke fået spillelister i ${hours} timer: ${item.reason}`
+    });
   }
 
+  const alerts = {};
+  const toMail = [];
   for (const problem of problems) {
-    console.log(`::warning::${problem}`);
+    const previous = previousAlerts[problem.key] || {};
+    const since = problem.since || previous.since || new Date(now).toISOString();
+    const hours = Math.floor((now - new Date(since)) / 36e5);
+    const message = problem.message(hours);
+    let mailedAt = previous.mailedAt;
+
+    if (hours < problem.minHours) {
+      console.log(`::notice::${message} (mail sendes efter ${problem.minHours} timer)`);
+    } else if (mailedAt && now - new Date(mailedAt) < ALERT_REPEAT_HOURS * 36e5) {
+      console.log(`::warning::${message} (mail er allerede sendt inden for ${ALERT_REPEAT_HOURS} timer)`);
+    } else {
+      console.log(`::warning::${message}`);
+      mailedAt = new Date(now).toISOString();
+      toMail.push(message);
+    }
+    alerts[problem.key] = { since, ...(mailedAt ? { mailedAt } : {}) };
   }
 
-  if (process.env.GITHUB_OUTPUT) {
-    const message = problems.join(" | ").replace(/[\r\n]+/g, " ");
-    await appendFile(process.env.GITHUB_OUTPUT, `alert=${problems.length ? "true" : "false"}\nalert_message=${message}\n`);
-  }
+  return { alerts, toMail };
 }
 
-function printReport({ built, reused, failed }) {
+async function writeAlertOutput({ toMail }) {
+  if (!process.env.GITHUB_OUTPUT) return;
+  const message = toMail.join(" | ").replace(/[\r\n]+/g, " ");
+  await appendFile(process.env.GITHUB_OUTPUT, `alert=${toMail.length ? "true" : "false"}\nalert_message=${message}\n`);
+}
+
+function printReport({ built, reused, failed, playlistProblems }) {
   console.log("");
   console.log(`Bygget: ${built.length}  Genbrugt: ${reused.length}  Fejlet: ${failed.length}`);
   for (const item of reused) console.log(`  genbrugt  ${item.slug}: ${item.reason}`);
   for (const item of failed) console.log(`  fejlet    ${item.slug}: ${item.reason}`);
+  for (const item of playlistProblems) console.log(`  spilleliste ${item.slug}: ${item.reason}`);
 
-  if (process.env.GITHUB_STEP_SUMMARY && (reused.length || failed.length)) {
+  if (process.env.GITHUB_STEP_SUMMARY && (reused.length || failed.length || playlistProblems.length)) {
     const lines = ["### Podcast-build", "", `Bygget: ${built.length} · Genbrugt: ${reused.length} · Fejlet: ${failed.length}`, ""];
     for (const item of reused) lines.push(`- ⚠️ genbrugt \`${item.slug}\`: ${item.reason}`);
     for (const item of failed) lines.push(`- ❌ fejlet \`${item.slug}\`: ${item.reason}`);
+    for (const item of playlistProblems) lines.push(`- 🎵 spilleliste \`${item.slug}\`: ${item.reason}`);
     return appendFile(process.env.GITHUB_STEP_SUMMARY, `${lines.join("\n")}\n`).catch(() => {});
   }
-}
-
-async function loadSeriesIndex() {
-  const data = await fetchJson(`${DR_API_URL}/series?limit=10000`);
-  const items = (data.items || []).filter((item) => item.type === "Series");
-  const bySlug = new Map();
-  const umbrellaGroups = new Map();
-
-  for (const item of items) {
-    const derivedSlug = deriveSlug(item);
-    const presentationSlug = derivePresentationSlug(item);
-    const umbrellaSlug = deriveUmbrellaSlug(item.umbrella);
-    if (derivedSlug) {
-      bySlug.set(derivedSlug, item);
-    }
-    if (presentationSlug) {
-      bySlug.set(presentationSlug, item);
-    }
-    if (umbrellaSlug && item.id) {
-      const group = umbrellaGroups.get(umbrellaSlug) || [];
-      group.push(item);
-      umbrellaGroups.set(umbrellaSlug, group);
-    }
-  }
-
-  return { bySlug, umbrellaGroups };
 }
 
 function resolvePodcast(index, podcast, slug) {
@@ -306,62 +322,11 @@ async function fetchEpisodes(urn) {
   return episodes;
 }
 
-async function fetchJson(url) {
-  const response = await fetchWithRetry(url, {
-    headers: {
-      "accept": "application/json",
-      "referer": "https://www.dr.dk/",
-      "user-agent": "privat-podcast-manager/2.0",
-      "x-apikey": DR_API_KEY
-    }
-  });
-  return response.json();
-}
-
-async function fetchWithRetry(url, options = {}, { attempts = RETRY_ATTEMPTS } = {}) {
-  let lastError;
-  for (let attempt = 1; attempt <= attempts; attempt++) {
-    try {
-      const response = await fetch(url, { ...options, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
-      if (response.ok) return response;
-
-      if (response.status === 401 || response.status === 403) {
-        // Giver ikke mening at prøve igen – typisk er nøglen udskiftet.
-        throw Object.assign(
-          new Error(`adgang nægtet (${response.status}) for ${shortUrl(url)}. API-nøglen er muligvis udskiftet – opdater variablen DR_API_KEY.`),
-          { fatal: true }
-        );
-      }
-      if (response.status === 404) {
-        throw Object.assign(new Error(`ikke fundet (404): ${shortUrl(url)}`), { fatal: true });
-      }
-      lastError = new Error(`svarede ${response.status} for ${shortUrl(url)}`);
-    } catch (error) {
-      if (error.fatal) throw error;
-      lastError = error.name === "TimeoutError"
-        ? new Error(`timeout efter ${REQUEST_TIMEOUT_MS / 1000}s for ${shortUrl(url)}`)
-        : error;
-    }
-    if (attempt < attempts) {
-      await sleep(1000 * 2 ** (attempt - 1));
-    }
-  }
-  throw lastError;
-}
-
-function shortUrl(url) {
-  return String(url).replace(/\?.*$/, "");
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 async function findPodcastImageUrl(slug) {
-  const response = await fetchWithRetry(`https://api.dr.dk/podcasts/v1/feeds/${slug}.xml?format=podcast`, {
-    headers: { "user-agent": "privat-podcast-manager/2.0" }
-  }, { attempts: 2 });
-  const xml = await response.text();
+  const xml = await fetchWithRetry(`https://api.dr.dk/podcasts/v1/feeds/${slug}.xml?format=podcast`, {}, {
+    attempts: 2,
+    read: (response) => response.text()
+  });
   return (
     /<itunes:image[^>]+href="([^"]+)"/i.exec(xml)?.[1] ||
     /<image>\s*<url>(.*?)<\/url>/s.exec(xml)?.[1] ||
@@ -379,11 +344,14 @@ function findRadioImageUrl(show) {
   return asset?.id ? `https://asset.dr.dk/drlyd/images/${asset.id}` : "";
 }
 
-async function loadPlaylists(episodes, limit, title) {
+async function loadPlaylists(episodes, limit, title, slug) {
   const fetchCount = Math.max(0, Number(limit) || 0);
   const playlists = new Map();
-  let fetched = 0;
-  let empty = 0;
+  let attempted = 0;
+  let found = 0;
+  let lastError = "";
+  // Har podcasten haft spillelister før? Ellers er det ikke en fejl, at der ingen er.
+  const hadPlaylists = episodes.some((episode) => previousPlaylists[String(episodeKey(episode))]?.length);
 
   console.log(`Henter playlister for de nyeste ${Math.min(fetchCount, episodes.length)} afsnit af ${title}`);
 
@@ -394,11 +362,12 @@ async function loadPlaylists(episodes, limit, title) {
     // De nyeste afsnit hentes altid på ny (spillelisten kan blive udfyldt senere);
     // ældre afsnit bruger den gemte spilleliste fra sidste udgivelse.
     if (index < fetchCount) {
+      attempted++;
       try {
         tracks = await fetchPlaylist(episode.presentationUrl);
-        fetched++;
-        if (!tracks.length) empty++;
+        if (tracks.length) found++;
       } catch (error) {
+        lastError = error.message;
         console.warn(`Kunne ikke hente playliste for ${episode.title}: ${error.message}`);
       }
     }
@@ -413,8 +382,15 @@ async function loadPlaylists(episodes, limit, title) {
     }
   }
 
-  if (fetched > 0 && fetched === empty) {
-    console.warn(`Advarsel: ingen af de ${fetched} hentede afsnit af ${title} havde en spilleliste. Sidens opbygning kan være ændret.`);
+  if (attempted > 0 && found === 0) {
+    const reason = lastError
+      ? `ingen af de ${attempted} nyeste afsnit gav en spilleliste (sidste fejl: ${lastError})`
+      : `ingen af de ${attempted} nyeste afsnit havde en spilleliste – sidens opbygning kan være ændret`;
+    if (hadPlaylists) {
+      report.playlistProblems.push({ slug, reason });
+    } else {
+      console.warn(`Bemærk: ${title}: ${reason}.`);
+    }
   }
 
   return playlists;
@@ -423,11 +399,7 @@ async function loadPlaylists(episodes, limit, title) {
 async function fetchPlaylist(pageUrl) {
   if (!pageUrl) return [];
 
-  const response = await fetchWithRetry(pageUrl, {
-    headers: { "user-agent": "privat-podcast-manager/2.0" }
-  }, { attempts: 2 });
-
-  const page = await response.text();
+  const page = await fetchWithRetry(pageUrl, {}, { attempts: 2, read: (response) => response.text() });
   const nextData = /<script[^>]*id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/i.exec(page)?.[1];
   if (!nextData) return [];
 
@@ -498,7 +470,7 @@ function formatTrackTime(milliseconds) {
 function renderFeed(feed) {
   const items = feed.items.filter(Boolean).map((item) => `
         <item>
-            <guid isPermalink="false">${xml(item.guid)}</guid>
+            <guid isPermaLink="false">${xml(item.guid)}</guid>
             <link>${xml(item.link)}</link>
             <title>${xml(item.title)}</title>
             <description>${xml(item.description)}</description>
@@ -591,33 +563,6 @@ ${cards}
 `;
 }
 
-function deriveSlug(item) {
-  const fromPodcastUrl = item.podcastUrl ? String(item.podcastUrl).split("/").filter(Boolean).at(-1) : "";
-  return normalizeSlug(fromPodcastUrl || item.psdbSlug || item.slug || "");
-}
-
-function derivePresentationSlug(item) {
-  const fromPresentationUrl = item.presentationUrl ? String(item.presentationUrl).split("/").filter(Boolean).at(-1) : "";
-  return normalizeSlug(fromPresentationUrl || item.slug || "");
-}
-
-function deriveUmbrellaSlug(umbrella) {
-  if (!umbrella) return "";
-  const fromUrl = umbrella.presentationUrl ? String(umbrella.presentationUrl).split("/").filter(Boolean).at(-1) : "";
-  return normalizeSlug(fromUrl || umbrella.slug || "");
-}
-
-function normalizeSlug(value) {
-  return String(value)
-    .replace(/\.xml.*$/, "")
-    .replace(/-\d+$/, "")
-    .replace(/^sara-og-monopolet-podcast$/, "sara-og-monopolet")
-    .replace(/^mads-monopolet-podcast$/, "sara-og-monopolet")
-    .replace(/^hjernekassen-paa-p1$/, "hjernekassen")
-    .replace(/^hjernekassen-pa-p1$/, "hjernekassen")
-    .replace(/^moerklagt-agent-samsam$/, "moerklagt");
-}
-
 function uniqueByProductionNumber(items) {
   const seen = new Set();
   return items.filter((item) => {
@@ -648,8 +593,16 @@ function formatRssDate(date) {
   return `${days[date.getUTCDay()]}, ${String(date.getUTCDate()).padStart(2, "0")} ${months[date.getUTCMonth()]} ${date.getUTCFullYear()} ${String(date.getUTCHours()).padStart(2, "0")}:${String(date.getUTCMinutes()).padStart(2, "0")}:${String(date.getUTCSeconds()).padStart(2, "0")} +0000`;
 }
 
+// Tegn, der ikke er tilladt i XML (kontroltegn og enlige surrogat-tegn), fjernes, så feedet altid er gyldigt.
+function stripInvalidXml(value = "") {
+  return String(value).replace(
+    /[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g,
+    ""
+  );
+}
+
 function xml(value = "") {
-  return String(value)
+  return stripInvalidXml(value)
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
@@ -662,7 +615,7 @@ function html(value = "") {
 }
 
 function cdata(value = "") {
-  return String(value).replaceAll("]]>", "]]]]><![CDATA[>");
+  return stripInvalidXml(value).replaceAll("]]>", "]]]]><![CDATA[>");
 }
 
 function unxml(value = "") {
@@ -730,6 +683,8 @@ input {
   color: inherit;
   text-decoration: none;
 }
+
+.podcast[hidden] { display: none; }
 
 .podcast img, .cover {
   width: 100%;

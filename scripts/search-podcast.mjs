@@ -1,28 +1,14 @@
-const query = process.argv.slice(2).join(" ").trim().toLowerCase();
-const DR_API_KEY = process.env.DR_API_KEY || "6Wkh8s98Afx1ZAaTT4FuWODTmvWGDPpR";
+import { derivePresentationSlug, deriveSlug, deriveUmbrellaSlug, loadSeriesIndex } from "./lib/dr.mjs";
 
+const query = process.argv.slice(2).join(" ").trim().toLowerCase();
 if (!query) {
   console.error("Brug: npm run search -- stjerner");
   console.error("eller: npm run search -- \"p6 elsker\"");
   process.exit(1);
 }
 
-const response = await fetch("https://api.dr.dk/radio/v2/series?limit=10000", {
-  headers: {
-    "accept": "application/json",
-    "referer": "https://www.dr.dk/",
-    "user-agent": "privat-dr-podcast-manager/2.0",
-    "x-apikey": DR_API_KEY
-  }
-});
-
-if (!response.ok) {
-  throw new Error(`DR API svarede ${response.status}`);
-}
-
-const data = await response.json();
-const matches = (data.items || [])
-  .filter((item) => item.type === "Series")
+const { items, umbrellaGroups } = await loadSeriesIndex();
+const matches = items
   .map((item) => {
     const podcastSlug = deriveSlug(item);
     const pageSlug = derivePresentationSlug(item);
@@ -58,12 +44,19 @@ for (const [index, match] of matches.entries()) {
   }
   console.log(`   DR-link:        ${item.presentationUrl || ""}`);
   console.log(`   URN:            ${item.id}`);
+
+  // Del af en samleserie: brug samleseriens slug uden urn, så alle sæsoner kommer med.
+  const umbrellaSlug = deriveUmbrellaSlug(item.umbrella);
+  const isPartOfCollection = umbrellaSlug && (umbrellaGroups.get(umbrellaSlug)?.length || 0) > 1;
+  const entry = isPartOfCollection
+    ? { slug: umbrellaSlug, title: item.umbrella?.title || item.title }
+    : { slug: recommendedSlug, urn: item.id, title: item.title };
+  if (isPartOfCollection) {
+    console.log(`   Del af samleserien "${umbrellaSlug}" – brug kun slug, så alle sæsoner kommer med.`);
+  }
+
   console.log("   Kopier til podcasts.json:");
-  console.log(JSON.stringify({
-    slug: recommendedSlug,
-    urn: item.id,
-    title: item.title
-  }, null, 2).split("\n").map((line) => `   ${line}`).join("\n"));
+  console.log(JSON.stringify(entry, null, 2).split("\n").map((line) => `   ${line}`).join("\n"));
 }
 
 function score(entry, query) {
@@ -72,25 +65,4 @@ function score(entry, query) {
   if (title.startsWith(query)) return 80;
   if (entry.pageSlug === query || entry.podcastSlug === query) return 70;
   return 10;
-}
-
-function deriveSlug(item) {
-  const fromPodcastUrl = item.podcastUrl ? String(item.podcastUrl).split("/").filter(Boolean).at(-1) : "";
-  return normalizeSlug(fromPodcastUrl || item.psdbSlug || item.slug || "");
-}
-
-function derivePresentationSlug(item) {
-  const fromPresentationUrl = item.presentationUrl ? String(item.presentationUrl).split("/").filter(Boolean).at(-1) : "";
-  return normalizeSlug(fromPresentationUrl || item.slug || "");
-}
-
-function normalizeSlug(value) {
-  return String(value)
-    .replace(/\.xml.*$/, "")
-    .replace(/-\d+$/, "")
-    .replace(/^sara-og-monopolet-podcast$/, "sara-og-monopolet")
-    .replace(/^mads-monopolet-podcast$/, "sara-og-monopolet")
-    .replace(/^hjernekassen-paa-p1$/, "hjernekassen")
-    .replace(/^hjernekassen-pa-p1$/, "hjernekassen")
-    .replace(/^moerklagt-agent-samsam$/, "moerklagt");
 }
