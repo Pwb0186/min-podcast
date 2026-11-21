@@ -23,7 +23,13 @@
     {
       "slug": "bangers-med-ena",
       "urn": "urn:dr:radio:series:658a0b71163dfa22d5605d6c",
-      "title": "Bangers",
+      "title": "Bangers med Ena",
+      "includePlaylist": true
+    },
+    {
+      "slug": "bangers-med-emma",
+      "urn": ""urn:dr:radio:series:6ae318ff6c396c5ca036015f",
+      "title": "Bangers med Emma",
       "includePlaylist": true
     },
     {
